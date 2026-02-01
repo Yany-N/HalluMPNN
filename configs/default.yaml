@@ -1,0 +1,171 @@
+# HalluMPNN Default Configuration
+# ================================
+# Combined BetterMPNN + HalluDesign for L-DOPA binding SBP design
+
+# ============================================
+# Path Configuration
+# ============================================
+paths:
+  # AlphaFold3
+  af3_sif: "/data/home/scvi041/run/af3/3.0.1_run/alphafold3.sif"
+  af3_model_dir: "/data/home/scvi041/run/af3/model"
+  af3_db_dir: "/data/public/alphafold3/dataset"
+  singularity_bin: "/data/apps/apptainer/apptainer/bin/singularity"
+  
+  # LigandMPNN
+  ligandmpnn_weights: "/data/home/scvi041/run/LigandMPNN/model_params/ligandmpnn_v_32_010_25.pt"
+  
+  # Output (checkpoints and figures are auto-created inside output_dir)
+  output_dir: "./outputs"
+
+# ============================================
+# Scaffold Configuration
+# ============================================
+scaffold:
+  name: "3LFT"
+  # Complete 3LFT SBP sequence (Streptococcus pneumoniae, 285 residues)
+  sequence: "SNAKIGVLQFVSHPSLDLIYKGIQDGLAEEGYKDDQVKIDFMNSEGDQSKVATMSKQLVANGNDLVVGIATPAAQGLASATKDLPVIMAAITDPIGANLVKDLKKPGGNVTGVSDHNPAQQQVELIKALTPNVKTIGALYSSSEDNSKTQVEEFKAYAEKAGLTVETFAVPSTNEIASTVTVMTSKVDAIWVPIDNTIASGFPTVVSSNQSSKKPIYPSATAMVEVGGLASVVIDQHDLGVATGKMIVQVLKGAKPADTPVNVFSTGKSVINKKIAQELGITIPESVLKEAGQVI"
+
+# ============================================
+# Ligand Configuration
+# ============================================
+ligand:
+  name: "L-DOPA"
+  smiles: "N[C@@H](CC1=CC(=C(C=C1)O)O)C(=O)O"
+
+# ============================================
+# Design Scope Configuration (NEW)
+# ============================================
+# Specify which residues to redesign, all others remain fixed
+# Format: "ChainResidueNumber" (e.g., "A16" = Chain A, Residue 16)
+# If not specified or empty, the entire chain will be designed
+design:
+  redesign_residues:
+    - "A15"   # ALA 15
+    - "A16"   # LEU 16
+    - "A17"   # GLU 17
+    - "A18"   # ALA 18
+    - "A19"   # ILE 19
+    - "A70"   # GLY 70
+    - "A90"   # ALA 90
+    - "A91"   # VAL 91
+    - "A92"   # THR 92
+    - "A93"   # ASP 93
+    - "A96"   # GLY 96
+    - "A97"   # PHE 97
+    - "A114"  # ALA 114
+    - "A115"  # GLN 115
+    - "A194"  # ILE 194
+    - "A195"  # ASP 195
+    - "A196"  # THR 196
+    - "A197"  # VAL 197
+    - "A219"  # ALA 219
+    - "A220"  # SER 220
+    - "A233"  # ALA 233
+
+# ============================================
+# GRPO Training Configuration
+# ============================================
+grpo:
+  # Training
+  training_steps: 500         # BetterMPNN训练轮数 (full training)
+  num_generations: 4            # Variants per step (reduced for testing)
+  learning_rate: 1.0e-5
+  beta: 0.01                  # KL divergence weight
+  temperature: 0.6            # Increased from 0.5 for more sequence diversity
+  
+  # Reward Weights (Quality Components)
+  # These weights apply to the quality_reward portion
+  reward_weights:
+    iptm: 0.50              # Binding affinity
+    ptm: 0.30               # Overall structure quality
+    pae: 0.20               # Predicted alignment error
+    specificity: 0.30       # Negative design bonus weight
+    spec_gap: 0.10          # Minimum gap for specificity bonus
+  
+  # ============================================
+  # Curriculum Learning Configuration (NEW)
+  # ============================================
+  curriculum:
+    early_steps: 11           # End of early phase (easy requirements)
+    late_steps: 31            # Start of late phase (strict requirements)
+    early_threshold: 2.0      # Conf RMSD threshold during early phase (Å)
+    late_threshold: 4.0       # Conf RMSD threshold during late phase (Å)
+  
+  # Conformational Change Target
+  target_conformational_rmsd: 6.0  # Target RMSD for max reward (Å)
+  
+  # SBP Structure Preservation
+  # Prevents rewarding high conf_rmsd that comes from structural deviation
+  sbp_max_deviation: 8.0      # Max allowed bound vs scaffold RMSD (Å)
+  
+  # Open State Reference
+  open_rmsd:
+    path: "inputs/3lft-open.pdb" # Path to Open reference PDB
+    cutoff: 6.0               # Max RMSD to count as "matching" open state
+
+# ============================================
+# Decoy Configuration (Negative Design)
+# ============================================
+# Decoys are used for two purposes:
+# 1. Binding specificity: L-DOPA should have higher iPTM than decoys
+# 2. Conformational specificity: Decoys should NOT cause closing
+decoy_smiles:
+  - "N[C@@H](Cc1ccc(O)cc1)C(=O)O"      # Tyrosine (key: should NOT trigger closing)
+  - "N[C@@H](Cc1c[nH]c2ccccc12)C(=O)O" # Tryptophan
+
+# Max conf_rmsd allowed for decoys (they should stay open)
+decoy_max_conf_rmsd: 2.0
+
+# ============================================
+# HalluDesign Configuration
+# ============================================
+halludesign:
+  # Enable/disable
+  enabled: true               # Enabled for full training
+  use_protenix: true          # Use Protenix for REF-guided diffusion
+  protenix_model_dir: "/data/home/scvi041/run/HalluDesign-main/model"
+  
+  # Trigger configuration (NEW periodic system)
+  trigger_threshold:
+    # Force trigger at this step (once only, for initial pocket refinement)
+    force_trigger_step: 0
+    
+    # After threshold met, trigger HalluDesign every N steps
+    trigger_every_n_steps: 20
+    
+    # Threshold conditions for periodic triggering
+    iptm_min: 0.7             # Trigger when iptm >= 0.7
+    ptm_min: 0.6              # AND ptm >= 0.6
+    pae_max: 10.0             # AND pae <= 10.0
+  
+  # HalluDesign cycles when triggered
+  num_cycles: 3               # Cycles per trigger
+  num_sequences_per_cycle: 4  # Sequences per cycle
+  
+  # Pocket refinement parameters
+  pocket_cutoff: 8.0          # Angstroms
+  ref_time_steps: 100         # Diffusion steps for structure refinement
+
+# ============================================
+# AlphaFold3 Configuration
+# ============================================
+af3:
+  num_seeds: 2                # Model seeds for prediction
+  run_data_pipeline: false    # Skip MSA generation (use provided)
+  timeout: 3600               # Seconds
+
+# ============================================
+# Checkpoint Configuration
+# ============================================
+checkpoint:
+  save_every: 10              # Save every N steps
+  keep_last: 500                # Keep last N checkpoints
+
+# ============================================
+# Logging
+# ============================================
+logging:
+  level: "INFO"
+  wandb_project: "hallumpnn"
+  log_rewards: true
