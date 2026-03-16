@@ -1,17 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-HalluMPNN Main Training Script
-
-Combines BetterMPNN (GRPO training with LigandMPNN) + HalluDesign (pocket refinement)
-using AlphaFold3 for structure prediction.
-
-Workflow:
-1. BetterMPNN GRPO training with LigandMPNN + AF3 evaluation
-2. Trigger HalluDesign pocket refinement when thresholds are met
-3. Continue BetterMPNN from best HalluDesign result
-4. Repeat as needed
-"""
-
 # ============================================================
 # CRITICAL: JAX 0.9.0 compatibility patch
 # This patch must run BEFORE any module imports jax/alphafold3
@@ -785,7 +771,8 @@ class HalluMPNNTrainer:
         self,
         current_sequence: str,
         step: int,
-        current_pdb_path: Optional[Path] = None
+        current_pdb_path: Optional[Path] = None,
+        precomputed_features: Optional[Dict[str, Any]] = None, # NEW: support pre-loaded features
     ) -> Dict[str, Any]:
         """
         Execute one GRPO training step.
@@ -794,6 +781,7 @@ class HalluMPNNTrainer:
             current_sequence: Current best sequence
             step: Step number
             current_pdb_path: Path to current best PDB structure (refined by HalluDesign)
+            precomputed_features: Pre-calculated LigandMPNN features (for multi-backbone mode)
         
         Returns:
             step_results: Results including reward and metrics
@@ -804,22 +792,29 @@ class HalluMPNNTrainer:
         # ====================
         # 1. Generate sequence variants with LigandMPNN
         # ====================
-        # CRITICAL FIX: Use current_pdb_path (from HalluDesign) if available, else scaffold
-        # This allows LigandMPNN to see the refined geometry
-        input_pdb = str(current_pdb_path) if current_pdb_path and current_pdb_path.exists() else str(self.scaffold_pdb)
+        # Priority:
+        # 1. Precomputed features (Multi-Backbone Mode) -> Passed directly
+        # 2. current_pdb_path (HalluDesign refined) -> Parse this
+        # 3. self.scaffold_pdb (Standard Mode) -> Parse this
         
-        if input_pdb and os.path.exists(input_pdb):
-            logger.info(f"Generating {self.num_generations} variants with LigandMPNN (pdb: {input_pdb})...")
+        # Determine input source
+        input_pdb = None
+        if not precomputed_features:
+            input_pdb = str(current_pdb_path) if current_pdb_path and current_pdb_path.exists() else str(self.scaffold_pdb)
+        
+        if precomputed_features or (input_pdb and os.path.exists(input_pdb)):
+            logger.info(f"Generating {self.num_generations} variants with LigandMPNN (Source: {'Precomputed' if precomputed_features else input_pdb})...")
             try:
                 result = generate_sequences_with_ligandmpnn(
                     model=self.model,
-                    pdb_path=input_pdb,
+                    pdb_path=input_pdb if input_pdb else "dummy", # pdb_path ignored if features provided
                     chain_to_design=self.chain_to_design,
                     num_variants=self.num_generations,
                     temperature=self.temperature,
                     redesigned_residues=self.redesign_residues,  # NEW: restrict to specific pocket residues
                     use_ligand_context=True,
-                    device=self.device
+                    device=self.device,
+                    feature_dict=precomputed_features # Pass precomputed features
                 )
                 variants = result["sequences"]
                 feature_dict = result["feature_dict"]
@@ -911,8 +906,9 @@ class HalluMPNNTrainer:
             # 3. AF3 WITH Decoys (Negative Design + Conformational Specificity)
             # Goal: Decoys should have LOW iPTM (weak binding) and LOW conf_rmsd (no closing)
             decoy_iptms = []
-            decoy_conf_rmsds = []  # Track if decoys cause closing (vs Unbound) [DEPRECATED logic but kept]
-            decoy_closed_rmsds = [] # Track if decoys match Closed Ref (NEW: User Logic 3)
+            decoy_conf_rmsds = []  # Track if decoys cause closing (vs Unbound)
+            decoy_closed_rmsds = [] # Track if decoys match Closed Ref
+            decoy_contrast_rmsds = [] # NEW: Track if decoy matches Target Bound (Contrastive)
             
             # Pre-load Closed Ref coords for efficiency
             closed_ref_coords = None
@@ -941,30 +937,61 @@ class HalluMPNNTrainer:
                 if af3_decoy.get('success', False):
                     decoy_iptms.append(af3_decoy.get('iptm', 0.0))
                     
-                    # Compute conformational RMSD for decoy (decoy-bound vs unbound)
+                    # Compute conformational metrics
                     decoy_path = af3_decoy.get('cif_path') or af3_decoy.get('pdb_path')
-                    if decoy_path and os.path.exists(decoy_path) and unbound_coords is not None:
+                    if decoy_path and os.path.exists(decoy_path):
                         decoy_coords = extract_ca_coords_from_cif(decoy_path, self.chain_to_design) if decoy_path.endswith('.cif') else extract_ca_coords_from_pdb(decoy_path, self.chain_to_design)
+                        
                         if decoy_coords is not None:
-                            decoy_conf_rmsd = calculate_rmsd(decoy_coords, unbound_coords, align=True)
-                            decoy_conf_rmsds.append(decoy_conf_rmsd)
-                            logger.info(f"    Decoy {d_idx} conf_rmsd: {decoy_conf_rmsd:.2f}Å")
-                            
-                            # NEW: Calculate vs Closed Ref
-                            if closed_ref_coords is not None:
-                                d_closed_rmsd = calculate_rmsd(decoy_coords, closed_ref_coords, align=True)
-                                decoy_closed_rmsds.append(d_closed_rmsd)
-                                logger.info(f"    Decoy {d_idx} vs Closed Ref: {d_closed_rmsd:.2f}Å (Should be LARGE)")
+                            # 1. Conf RMSD (vs Unbound) [Should be LOW]
+                            if unbound_coords is not None:
+                                d_conf = calculate_rmsd(decoy_coords, unbound_coords, align=True)
+                                decoy_conf_rmsds.append(d_conf)
                             else:
-                                decoy_closed_rmsds.append(99.9) # Unknown
+                                decoy_conf_rmsds.append(0.0)
+                                
+                            # 2. Closed Ref RMSD (vs Scaffold) [Should be HIGH]
+                            if closed_ref_coords is not None:
+                                d_closed = calculate_rmsd(decoy_coords, closed_ref_coords, align=True)
+                                decoy_closed_rmsds.append(d_closed)
+                            else:
+                                decoy_closed_rmsds.append(99.9)
+                                
+                            # 3. Contrast RMSD (vs Target Bound) [Should be HIGH]
+                            if bound_coords is not None:
+                                d_contrast = calculate_rmsd(decoy_coords, bound_coords, align=True)
+                                decoy_contrast_rmsds.append(d_contrast)
+                                logger.info(f"    Decoy {d_idx}: Conf={decoy_conf_rmsds[-1]:.2f}Å, Contrast={d_contrast:.2f}Å")
+                            else:
+                                decoy_contrast_rmsds.append(99.9)
                         else:
                             decoy_conf_rmsds.append(0.0)
                             decoy_closed_rmsds.append(99.9)
+                            decoy_contrast_rmsds.append(99.9)
                     else:
                         decoy_conf_rmsds.append(0.0)
+                        decoy_closed_rmsds.append(99.9)
+                        decoy_contrast_rmsds.append(99.9)
                 else:
                     decoy_iptms.append(0.0)
                     decoy_conf_rmsds.append(0.0)
+                    decoy_closed_rmsds.append(99.9)
+                    decoy_contrast_rmsds.append(99.9)
+
+            # ====================
+            # NEW: Contrastive RMSD (L-DOPA Bound vs Decoy Bound)
+            # ====================
+            # This block is now handled within the decoy loop above.
+            # decoy_contrast_rmsds = []
+            # if bound_coords is not None:
+            #     # We need to re-iterate or store decoy coords. 
+            #     # Since we didn't store decoy coords in the loop above (only RMSDs), 
+            #     # we technically should have. But for minimal invasion, let's re-extract or move extraction.
+            #     # BETTER: Modify the loop above to store contrast RMSD on the fly.
+            #     pass 
+                
+            # Actually, let's rewrite the loop above to include contrast calc
+
             
             decoy_stats = {
                 'iptms': decoy_iptms,
@@ -1419,36 +1446,78 @@ class HalluMPNNTrainer:
         
         return False
     
-    @staticmethod
-    def cleanup_step_files(step_dir: Path):
-        """Clean up intermediate files to save space, keeping only models."""
+    def cleanup_step_files(self, step_dir: Path):
+        """
+        Clean up intermediate files to save space.
+        
+        Policy:
+        1. Move *_model.cif to output_dir/all_cif/
+        2. Move *_summary_confidences.json to output_dir/all_json/
+        3. DELETE everything else in step_dir (including subdirs)
+        """
         if not step_dir.exists():
             return
             
-        logger.info(f"Cleaning up step directory: {step_dir}")
+        logger.info(f"Processing results and cleaning up: {step_dir}")
+        
+        # Create destination directories
+        all_cif_dir = self.output_dir / "all_cif"
+        all_json_dir = self.output_dir / "all_json"
+        all_cif_dir.mkdir(exist_ok=True)
+        all_json_dir.mkdir(exist_ok=True)
+        
+        cif_count = 0
+        json_count = 0
         deleted_count = 0
         
         # Walk through all files
-        for root, dirs, files in os.walk(step_dir):
+        # Use topdown=False to remove files before directories
+        for root, dirs, files in os.walk(step_dir, topdown=False):
             for file in files:
                 file_path = Path(root) / file
                 
-                # Keep important model files
-                # 1. PDB/CIF models
-                if file.endswith('.cif') or file.endswith('.pdb'):
-                    continue
-                # 2. Summary stats (for metric loading)
-                if 'summary_confidences' in file:
-                    continue
+                # 1. CIF Models -> all_cif
+                if file.endswith('_model.cif'):
+                    dest = all_cif_dir / file
+                    if not dest.exists():
+                        try:
+                            shutil.copy2(file_path, dest)
+                            cif_count += 1
+                        except OSError as e:
+                            logger.warning(f"Failed to copy CIF {file}: {e}")
                 
-                # Delete everything else (JSONs, SH, logs, seeds inputs)
+                # 2. JSON Stats -> all_json
+                elif file.endswith('_summary_confidences.json'):
+                    dest = all_json_dir / file
+                    if not dest.exists():
+                        try:
+                            shutil.copy2(file_path, dest)
+                            json_count += 1
+                        except OSError as e:
+                            logger.warning(f"Failed to copy JSON {file}: {e}")
+                
+                # 3. DELETE EVERYTHING (original CIF/JSON included)
                 try:
                     os.remove(file_path)
                     deleted_count += 1
                 except OSError as e:
                     logger.warning(f"Failed to delete {file_path}: {e}")
+            
+            # Remove empty directories
+            for dir_name in dirs:
+                dir_path = Path(root) / dir_name
+                try:
+                    os.rmdir(dir_path)
+                except OSError:
+                    pass # Directory might not be empty
                     
-        logger.info(f"Cleaned up {deleted_count} intermediate files.")
+        # Try to remove the step directory itself
+        try:
+            os.rmdir(step_dir)
+        except OSError:
+            pass # Keep if not empty
+            
+        logger.info(f"Cleaned up {step_dir}: Moved {cif_count} CIFs, {json_count} JSONs. Deleted {deleted_count} files.")
 
     def train(
         self, 
@@ -1511,8 +1580,49 @@ class HalluMPNNTrainer:
         
         logger.info(f"Starting training: steps={self.training_steps}, hallu={hallu_trigger}")
         logger.info(f"Scaffold sequence: {len(current_sequence)} residues")
-        logger.info(f"Scaffold PDB (constant for LigandMPNN): {self.scaffold_pdb}")
         
+        # Support for Multi-Backbone / Directory Input
+        scaffold_path_obj = Path(scaffold_pdb)
+        self.backbone_mode = "single"
+        self.backbone_features_list = []
+        
+        if scaffold_path_obj.is_dir():
+            logger.info(f"Scaffold path is a directory: {scaffold_pdb}")
+            self.backbone_mode = "multi"
+            # Find all pdb files
+            pdb_files = sorted(list(scaffold_path_obj.glob("*.pdb")))
+            if not pdb_files:
+                raise ValueError(f"No .pdb files found in {scaffold_pdb}")
+            
+            logger.info(f"Found {len(pdb_files)} PDB scaffolds.")
+            logger.info("Pre-calculating LigandMPNN features for all backbones... (this may take a moment)")
+            
+            from ligandmpnn_utils import prepare_ligandmpnn_features
+            
+            for p in pdb_files:
+                try:
+                    features = prepare_ligandmpnn_features(
+                        pdb_path=str(p),
+                        chain_to_design=self.chain_to_design,
+                        fixed_residues=None, # Assuming restrictions handled elsewhere or uniform
+                        redesigned_residues=self.redesign_residues, 
+                        use_ligand_context=True,
+                        device=self.device
+                    )
+                    # Store path for logging reference if needed
+                    features["_source_pdb"] = str(p)
+                    self.backbone_features_list.append(features)
+                except Exception as e:
+                    logger.warning(f"Failed to process backbone {p}: {e}")
+            
+            if not self.backbone_features_list:
+                raise RuntimeError("Failed to process any backbones from directory!")
+                
+            logger.info(f"Successfully loaded {len(self.backbone_features_list)} backbone feature sets.")
+            
+        else:
+            logger.info(f"Scaffold PDB (single): {self.scaffold_pdb}")
+            
         # Main training loop
         for step in range(self.step, self.training_steps):
             self.step = step
@@ -1521,9 +1631,30 @@ class HalluMPNNTrainer:
             logger.info(f"Step {step}/{self.training_steps}")
             logger.info(f"{'='*60}")
             
-            # GRPO step (updates self.current_pdb internally)
-            # FIX: Pass current_pdb to allow LigandMPNN to design on refined structure
-            metrics = self.grpo_step(current_sequence, step, current_pdb_path=self.current_pdb)
+            # Select random backbone if in multi mode
+            current_features = None
+            pdb_source = str(self.scaffold_pdb)
+            
+            if self.backbone_mode == "multi":
+                # NEW: If current_pdb is a file (refined by HalluDesign), prioritize it!
+                if self.current_pdb.is_file():
+                    current_features = None
+                    pdb_source = str(self.current_pdb)
+                    logger.info(f"Using refined structure from HalluDesign: {self.current_pdb.name}")
+                else:
+                    import random
+                    current_features = random.choice(self.backbone_features_list)
+                    pdb_source = current_features.get("_source_pdb", "unknown")
+                    logger.info(f"Multi-Backbone: Selected scaffold {os.path.basename(pdb_source)}")
+            
+            # GRPO step
+            # Pass initialized features to avoid re-parsing
+            metrics = self.grpo_step(
+                current_sequence, 
+                step, 
+                current_pdb_path=self.current_pdb, # Always pass current_pdb (will handle file vs dir inside)
+                precomputed_features=current_features # Pass features directly
+            )
             
             # Check HalluDesign trigger (periodic, force, or manual)
             should_trigger = self.hallu_enabled and self.check_hallu_trigger(metrics)
@@ -1534,8 +1665,18 @@ class HalluMPNNTrainer:
                 logger.info("=" * 60)
                 
                 # Run HalluDesign with current best structure
+                # NEW PRORITY: Use self.best_structure_path (best AF3 result) if available
+                # Fallback to self.current_pdb (refined) or initial scaffold.
+                hallu_input = str(self.current_pdb)
+                if hasattr(self, 'best_structure_path') and self.best_structure_path and os.path.exists(str(self.best_structure_path)):
+                    hallu_input = str(self.best_structure_path)
+                    logger.info(f"HalluDesign starting from current best generated structure: {os.path.basename(hallu_input)}")
+                elif self.current_pdb.is_dir():
+                    # Safeguard for initial multi-backbone state if no best_structure_path yet
+                    logger.warning("HalluDesign triggered but no best structure found yet, fallback to directory (likely will fail)")
+                
                 results, refined_pdb = self.hallu_design_step(
-                    str(self.current_pdb),  # Use current best PDB
+                    hallu_input, 
                     self.best_sequence
                 )
                 
