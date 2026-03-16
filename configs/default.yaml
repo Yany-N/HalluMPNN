@@ -1,7 +1,3 @@
-# HalluMPNN Default Configuration
-# ================================
-# Combined BetterMPNN + HalluDesign for L-DOPA binding SBP design
-
 # ============================================
 # Path Configuration
 # ============================================
@@ -41,27 +37,63 @@ ligand:
 # If not specified or empty, the entire chain will be designed
 design:
   redesign_residues:
-    - "A15"   # ALA 15
-    - "A16"   # LEU 16
-    - "A17"   # GLU 17
-    - "A18"   # ALA 18
-    - "A19"   # ILE 19
-    - "A70"   # GLY 70
-    - "A90"   # ALA 90
-    - "A91"   # VAL 91
-    - "A92"   # THR 92
-    - "A93"   # ASP 93
-    - "A96"   # GLY 96
-    - "A97"   # PHE 97
-    - "A114"  # ALA 114
-    - "A115"  # GLN 115
-    - "A194"  # ILE 194
-    - "A195"  # ASP 195
-    - "A196"  # THR 196
-    - "A197"  # VAL 197
-    - "A219"  # ALA 219
-    - "A220"  # SER 220
-    - "A233"  # ALA 233
+    - "A10"
+    - "A11"
+    - "A13"
+    - "A14"
+    - "A15"
+    - "A16"
+    - "A17"
+    - "A19"
+    - "A69"
+    - "A70"
+    - "A71"
+    - "A72"
+    - "A73"
+    - "A74"
+    - "A89"
+    - "A90"
+    - "A91"
+    - "A92"
+    - "A93"
+    - "A94"
+    - "A95"
+    - "A96"
+    - "A97"
+    - "A99"
+    - "A113"
+    - "A114"
+    - "A115"
+    - "A116"
+    - "A117"
+    - "A118"
+    - "A144"
+    - "A145"
+    - "A146"
+    - "A147"
+    - "A150"
+    - "A153"
+    - "A192"
+    - "A193"
+    - "A194"
+    - "A195"
+    - "A196"
+    - "A197"
+    - "A198"
+    - "A199"
+    - "A200"
+    - "A218"
+    - "A219"
+    - "A220"
+    - "A221"
+    - "A222"
+    - "A223"
+    - "A233"
+    - "A234"
+    - "A235"
+    - "A236"
+    - "A239"
+    - "A264"
 
 # ============================================
 # GRPO Training Configuration
@@ -87,8 +119,8 @@ grpo:
   # Curriculum Learning Configuration (NEW)
   # ============================================
   curriculum:
-    early_steps: 11           # End of early phase (easy requirements)
-    late_steps: 31            # Start of late phase (strict requirements)
+    early_steps: 30           # End of early phase (easy requirements)
+    late_steps: 80            # Start of late phase (strict requirements)
     early_threshold: 2.0      # Conf RMSD threshold during early phase (Å)
     late_threshold: 4.0       # Conf RMSD threshold during late phase (Å)
   
@@ -110,9 +142,7 @@ grpo:
 # Decoys are used for two purposes:
 # 1. Binding specificity: L-DOPA should have higher iPTM than decoys
 # 2. Conformational specificity: Decoys should NOT cause closing
-decoy_smiles:
-  - "N[C@@H](Cc1ccc(O)cc1)C(=O)O"      # Tyrosine (key: should NOT trigger closing)
-  - "N[C@@H](Cc1c[nH]c2ccccc12)C(=O)O" # Tryptophan
+decoy_smiles: []
 
 # Max conf_rmsd allowed for decoys (they should stay open)
 decoy_max_conf_rmsd: 2.0
@@ -123,16 +153,16 @@ decoy_max_conf_rmsd: 2.0
 halludesign:
   # Enable/disable
   enabled: true               # Enabled for full training
-  use_protenix: true          # Use Protenix for REF-guided diffusion
+  use_protenix: true          # Actually "use structure guidance" but via AF3 JAX"
   protenix_model_dir: "/data/home/scvi041/run/HalluDesign-main/model"
   
   # Trigger configuration (NEW periodic system)
   trigger_threshold:
     # Force trigger at this step (once only, for initial pocket refinement)
-    force_trigger_step: 0
+    force_trigger_step: 1
     
     # After threshold met, trigger HalluDesign every N steps
-    trigger_every_n_steps: 20
+    trigger_every_n_steps: 30
     
     # Threshold conditions for periodic triggering
     iptm_min: 0.7             # Trigger when iptm >= 0.7
@@ -140,12 +170,12 @@ halludesign:
     pae_max: 10.0             # AND pae <= 10.0
   
   # HalluDesign cycles when triggered
-  num_cycles: 3               # Cycles per trigger
-  num_sequences_per_cycle: 4  # Sequences per cycle
+  num_cycles: 4               # Cycles per trigger
+  num_sequences_per_cycle: 8  # Sequences per cycle
   
   # Pocket refinement parameters
   pocket_cutoff: 8.0          # Angstroms
-  ref_time_steps: 100         # Diffusion steps for structure refinement
+  ref_time_steps: 50          # Diffusion steps for structure refinement
 
 # ============================================
 # AlphaFold3 Configuration
