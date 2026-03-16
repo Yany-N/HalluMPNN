@@ -1,14 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-HalluDesign Utilities for HalluMPNN - FIXED VERSION v2
-====================================================
-
-Fixed issues:
-1. AttributeError when best_pdb_path is None
-2. Residue ID parsing with insertion codes (e.g., "A123A", "B456R")
-3. Better error handling for PDB parsing edge cases
-"""
-
 import os
 import sys
 import json
@@ -521,7 +510,17 @@ class HalluDesignRunner:
             
             # Locate output PDB (convert from CIF if needed)
             cif_files = list(Path(output_dir).glob("**/*.cif"))
+            # Check if PKL exists with a small wait (FS latency)
+            import time
+            if not os.path.exists(pkl_dump_path):
+                time.sleep(1.0)
+            
             final_pkl = pkl_dump_path if os.path.exists(pkl_dump_path) else None
+            if final_pkl:
+                logger.info(f"  [DEBUG] Generated PKL ref: {final_pkl}")
+            else:
+                logger.warning(f"  [DEBUG] Failed to generate PKL ref at {pkl_dump_path}")
+
             
             if not cif_files:
                  pdb_files = list(Path(output_dir).glob("**/*.pdb"))
@@ -540,13 +539,16 @@ class HalluDesignRunner:
                          logger.warning("Fell back to CIF as PDB conversion failed")
                          final_pdb = final_cif 
             
-            return {
-                'success': True,
-                'pdb_path': final_pdb,
-                'cif_path': final_cif,
-                'pkl_path': final_pkl,  # NEW: Return pkl path for guided diffusion
-                'iptm': 0.5, 'ptm': 0.5, 'mean_pae': 10.0
-            }
+            # 4. Parse metrics from output
+            from af3_utils import parse_af3_output
+            results = parse_af3_output(output_dir)
+            
+            # Inject our manual paths and PKL
+            results['pdb_path'] = final_pdb
+            results['cif_path'] = final_cif
+            results['pkl_path'] = final_pkl
+            
+            return results
             
         except Exception as e:
             logger.error(f"AF3 prediction failed: {e}")
@@ -628,8 +630,8 @@ class HalluDesignRunner:
             name = f"cycle{cycle_num}_seq{seq_idx}"
             
             # Determine structure prediction strategy
-            # Use guidance if reference is provided and cycle > 0
-            use_guidance = (reference_ref is not None and cycle_num > 0 and self.use_guided)
+            # Use guidance if reference is provided and enabled
+            use_guidance = (reference_ref is not None and self.use_guided)
             
             logger.info(f"  Cycle {cycle_num}, Seq {seq_idx}: JAX AF3 (Guided={use_guidance})...")
             
@@ -639,6 +641,16 @@ class HalluDesignRunner:
                 name=name,
                 ref_pdb_path=reference_ref if use_guidance else None
             )
+            
+            # DEBUG LOGGING for Guidance Failure
+            if reference_ref and not use_guidance:
+                 logger.warning(f"  [DEBUG] Guidance skipped! ref={reference_ref}, cycle={cycle_num}, guided={self.use_guided}")
+                 if cycle_num > 0 and self.use_guided:
+                     logger.warning(f"  [DEBUG] Reference exists but not used? Check logic.")
+            
+            if use_guidance:
+                 logger.info(f"  [DEBUG] Using guidance with ref: {reference_ref}")
+
             
             af3_result = pred_result
             
@@ -774,7 +786,8 @@ class HalluDesignRunner:
         logger.info("=" * 60)
         
         current_pdb = initial_pdb
-        current_ref = None # No reference for Cycle 0
+        # NEW: Initialize guidance reference from starting PDB if it's a file
+        current_ref = initial_pdb if os.path.isfile(initial_pdb) else None
         
         overall_best = None
         overall_best_pdb = None
@@ -807,6 +820,8 @@ class HalluDesignRunner:
             if cycle_pdb and os.path.exists(cycle_pdb):
                 current_pdb = cycle_pdb  # PDB for pocket finding
                 current_ref = cycle_ref  # PKL (or PDB) for guided diffusion
+                logger.info(f"[DEBUG] Cycle {cycle} complete. Next input: {current_pdb}")
+                logger.info(f"[DEBUG] Cycle {cycle} complete. Next ref: {current_ref}")
             else:
                 logger.warning(f"Cycle {cycle} did not produce a valid PDB, stopping.")
                 break
